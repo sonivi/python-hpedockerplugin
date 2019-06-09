@@ -19,7 +19,7 @@ See https://github.com/docker/docker/tree/master/docs/extend for details.
 """
 import json
 import six
-import re
+import datetime
 
 from oslo_log import log as logging
 
@@ -27,12 +27,16 @@ import hpedockerplugin.exception as exception
 from hpedockerplugin.i18n import _, _LE, _LI
 from klein import Klein
 from hpedockerplugin.hpe import volume
+from ratelimit import limits
+from ratelimit.exception import RateLimitException
+from backoff import on_exception, expo
 
 import hpedockerplugin.backend_orchestrator as orchestrator
+import hpedockerplugin.request_validator as req_validator
+import hpedockerplugin.file_backend_orchestrator as f_orchestrator
+import hpedockerplugin.request_router as req_router
 
 LOG = logging.getLogger(__name__)
-
-DEFAULT_BACKEND_NAME = "DEFAULT"
 
 
 class VolumePlugin(object):
@@ -42,7 +46,7 @@ class VolumePlugin(object):
     """
     app = Klein()
 
-    def __init__(self, reactor, host_config, backend_configs):
+    def __init__(self, reactor, all_configs):
         """
         :param IReactorTime reactor: Reactor time interface implementation.
         :param Ihpepluginconfig : hpedefaultconfig configuration
@@ -50,13 +54,80 @@ class VolumePlugin(object):
         LOG.info(_LI('Initialize Volume Plugin'))
 
         self._reactor = reactor
-        self._host_config = host_config
-        self._backend_configs = backend_configs
+        self.orchestrator = None
+        if 'block' in all_configs:
+            block_configs = all_configs['block']
+            self._host_config = block_configs[0]
+            self._backend_configs = block_configs[1]
+            if 'DEFAULT' in self._backend_configs:
+                self._def_backend_name = 'DEFAULT'
+            elif 'DEFAULT_BLOCK' in self._backend_configs:
+                self._def_backend_name = 'DEFAULT_BLOCK'
+            else:
+                msg = "ERROR: DEFAULT backend is not present for the BLOCK " \
+                      "driver configuration. If DEFAULT backend has been " \
+                      "configured for FILE driver, then DEFAULT_BLOCK " \
+                      "backend MUST be configured for BLOCK driver in " \
+                      "hpe.conf file."
+                LOG.error(msg)
+                raise exception.InvalidInput(reason=msg)
+            if 'DEFAULT_FILE' in self._backend_configs:
+                msg = "ERROR: 'DEFAULT_FILE' backend cannot be defined " \
+                      "for BLOCK driver."
+                LOG.error(msg)
+                raise exception.InvalidInput(reason=msg)
 
-        # TODO: make device_scan_attempts configurable
-        # see nova/virt/libvirt/volume/iscsi.py
-        self.orchestrator = orchestrator.Orchestrator(host_config,
-                                                      backend_configs)
+            self.orchestrator = orchestrator.VolumeBackendOrchestrator(
+                self._host_config, self._backend_configs,
+                self._def_backend_name)
+            self._req_validator = req_validator.RequestValidator(
+                self._backend_configs)
+
+        self._file_orchestrator = None
+        if 'file' in all_configs:
+            file_configs = all_configs['file']
+            self._f_host_config = file_configs[0]
+            self._f_backend_configs = file_configs[1]
+
+            if 'DEFAULT' in self._f_backend_configs:
+                self._f_def_backend_name = 'DEFAULT'
+            elif 'DEFAULT_FILE' in self._f_backend_configs:
+                self._f_def_backend_name = 'DEFAULT_FILE'
+            else:
+                msg = "ERROR: DEFAULT backend is not present for the FILE " \
+                      "driver configuration. If DEFAULT backend has been " \
+                      "configured for BLOCK driver, then DEFAULT_FILE " \
+                      "backend MUST be configured for FILE driver in " \
+                      "hpe.conf file."
+                raise exception.InvalidInput(reason=msg)
+
+            if 'DEFAULT_BLOCK' in self._f_backend_configs:
+                msg = "ERROR: 'DEFAULT_BLOCK' backend cannot be defined " \
+                      "for FILE driver."
+                LOG.error(msg)
+                raise exception.InvalidInput(reason=msg)
+
+            self._file_orchestrator = f_orchestrator.FileBackendOrchestrator(
+                self._f_host_config, self._f_backend_configs,
+                self._f_def_backend_name)
+
+        self._req_router = req_router.RequestRouter(
+            vol_orchestrator=self.orchestrator,
+            file_orchestrator=self._file_orchestrator,
+            all_configs=all_configs)
+
+    def is_backend_initialized(self, backend_name):
+        if (backend_name not in self._backend_configs and
+                backend_name not in self._f_backend_configs):
+            return 'FAILED'
+
+        if backend_name in self.orchestrator._manager:
+            mgr_obj = self.orchestrator._manager[backend_name]
+            return mgr_obj.get('backend_state')
+        if backend_name in self._file_orchestrator._manager:
+            mgr_obj = self._file_orchestrator._manager[backend_name]
+            return mgr_obj.get('backend_state')
+        return 'INITIALIZING'
 
     def disconnect_volume_callback(self, connector_info):
         LOG.info(_LI('In disconnect_volume_callback: connector info is %s'),
@@ -74,6 +145,8 @@ class VolumePlugin(object):
         LOG.info(_LI('In Plugin Activate'))
         return json.dumps({u"Implements": [u"VolumeDriver"]})
 
+    @on_exception(expo, RateLimitException, max_tries=8)
+    @limits(calls=25, period=30)
     @app.route("/VolumeDriver.Remove", methods=["POST"])
     def volumedriver_remove(self, name):
         """
@@ -84,10 +157,36 @@ class VolumePlugin(object):
         :return: Result indicating success.
         """
         contents = json.loads(name.content.getvalue())
-        volname = contents['Name']
+        name = contents['Name']
 
-        return self.orchestrator.volumedriver_remove(volname)
+        LOG.info("Routing remove request...")
+        try:
+            return self._req_router.route_remove_request(name)
+        # If share is not found by this name, allow volume driver
+        # to handle the request by passing the except clause
+        except exception.EtcdMetadataNotFound:
+            pass
+        except exception.PluginException as ex:
+            return json.dumps({"Err": ex.msg})
+        except Exception as ex:
+            msg = six.text_type(ex)
+            LOG.error(msg)
+            return json.dumps({"Err": msg})
 
+        if self.orchestrator:
+            try:
+                return self.orchestrator.volumedriver_remove(name)
+            except exception.PluginException as ex:
+                return json.dumps({"Err": ex.msg})
+            except Exception as ex:
+                msg = six.text_type(ex)
+                LOG.error(msg)
+                return json.dumps({"Err": msg})
+
+        return json.dumps({"Err": ""})
+
+    @on_exception(expo, RateLimitException, max_tries=8)
+    @limits(calls=25, period=30)
     @app.route("/VolumeDriver.Unmount", methods=["POST"])
     def volumedriver_unmount(self, name):
         """
@@ -104,20 +203,26 @@ class VolumePlugin(object):
         volname = contents['Name']
 
         vol_mount = volume.DEFAULT_MOUNT_VOLUME
-        if ('Opts' in contents and contents['Opts'] and
-                'mount-volume' in contents['Opts']):
-            vol_mount = str(contents['Opts']['mount-volume'])
 
         mount_id = contents['ID']
-        return self.orchestrator.volumedriver_unmount(volname,
-                                                      vol_mount, mount_id)
+
+        try:
+            return self._req_router.route_unmount_request(volname, mount_id)
+        except exception.EtcdMetadataNotFound:
+            pass
+
+        if self.orchestrator:
+            return self.orchestrator.volumedriver_unmount(
+                volname, vol_mount, mount_id)
+        return json.dumps({"Err": "Unmount failed: volume/file '%s' not found"
+                                  % volname})
 
     @app.route("/VolumeDriver.Create", methods=["POST"])
-    def volumedriver_create(self, name, opts=None):
+    def volumedriver_create(self, request, opts=None):
         """
         Create a volume with the given name.
 
-        :param unicode name: The name of the volume.
+        :param unicode request: Request data
         :param dict opts: Options passed from Docker for the volume
             at creation. ``None`` if not supplied in the request body.
             Currently ignored. ``Opts`` is a parameter introduced in the
@@ -126,19 +231,44 @@ class VolumePlugin(object):
 
         :return: Result indicating success.
         """
-        contents = json.loads(name.content.getvalue())
+        contents = json.loads(request.content.getvalue())
         if 'Name' not in contents:
             msg = (_('create volume failed, error is: Name is required.'))
             LOG.error(msg)
             raise exception.HPEPluginCreateException(reason=msg)
-        volname = contents['Name']
 
-        is_valid_name = re.match("^[A-Za-z0-9]+[A-Za-z0-9_-]+$", volname)
-        if not is_valid_name:
-            msg = 'Invalid volume name: %s is passed.' % volname
-            LOG.debug(msg)
-            response = json.dumps({u"Err": msg})
-            return response
+        name = contents['Name']
+
+        if ((self.orchestrator and
+             self.orchestrator.volume_exists(name)) or
+            (self._file_orchestrator and
+             self._file_orchestrator.share_exists(name))):
+            return json.dumps({'Err': ''})
+
+        # Try to handle this as file persona operation
+        if 'Opts' in contents and contents['Opts']:
+            if 'filePersona' in contents['Opts']:
+                try:
+                    return self._req_router.route_create_request(
+                        name, contents, self._file_orchestrator
+                    )
+                except exception.PluginException as ex:
+                    LOG.error(six.text_type(ex))
+                    return json.dumps({'Err': ex.msg})
+                except Exception as ex:
+                    LOG.error(six.text_type(ex))
+                    return json.dumps({'Err': six.text_type(ex)})
+
+        if not self.orchestrator:
+            return json.dumps({"Err": "ERROR: Cannot create volume '%s'. "
+                                      "Volume driver is not configured" %
+                                      name})
+
+        # Continue with volume creation operations
+        try:
+            self._req_validator.validate_request(contents)
+        except exception.InvalidInput as ex:
+            return json.dumps({"Err": ex.msg})
 
         vol_size = volume.DEFAULT_SIZE
         vol_prov = volume.DEFAULT_PROV
@@ -153,25 +283,24 @@ class VolumePlugin(object):
         snap_cpg = None
         rcg_name = None
 
-        current_backend = DEFAULT_BACKEND_NAME
+        current_backend = self._def_backend_name
         if 'Opts' in contents and contents['Opts']:
             # Verify valid Opts arguments.
-            valid_volume_create_opts = ['mount-volume', 'compression',
-                                        'size', 'provisioning', 'flash-cache',
-                                        'cloneOf', 'virtualCopyOf',
-                                        'expirationHours', 'retentionHours',
-                                        'qos-name', 'fsOwner', 'fsMode',
-                                        'mountConflictDelay',
-                                        'help', 'importVol', 'cpg',
-                                        'snapcpg', 'scheduleName',
-                                        'scheduleFrequency', 'snapshotPrefix',
-                                        'expHrs', 'retHrs', 'backend',
-                                        'replicationGroup']
+            valid_volume_create_opts = [
+                'compression', 'size', 'provisioning', 'flash-cache',
+                'cloneOf', 'virtualCopyOf', 'expirationHours',
+                'retentionHours', 'qos-name', 'fsOwner', 'fsMode',
+                'mountConflictDelay', 'help', 'importVol', 'cpg',
+                'snapcpg', 'scheduleName', 'scheduleFrequency',
+                'snapshotPrefix', 'expHrs', 'retHrs', 'backend',
+                'replicationGroup', 'manager'
+            ]
             valid_snap_schedule_opts = ['scheduleName', 'scheduleFrequency',
                                         'snapshotPrefix', 'expHrs', 'retHrs']
-            mutually_exclusive = [['virtualCopyOf', 'cloneOf', 'qos-name',
-                                   'replicationGroup'],
-                                  ['virtualCopyOf', 'cloneOf', 'backend']]
+            mutually_exclusive = [
+                ['virtualCopyOf', 'cloneOf', 'qos-name', 'replicationGroup'],
+                ['virtualCopyOf', 'cloneOf', 'backend']
+            ]
             for key in contents['Opts']:
                 if key not in valid_volume_create_opts:
                     msg = (_('create volume/snapshot/clone failed, error is: '
@@ -194,6 +323,12 @@ class VolumePlugin(object):
             if ('backend' in contents['Opts'] and
                     contents['Opts']['backend'] != ""):
                 current_backend = str(contents['Opts']['backend'])
+                if current_backend == 'DEFAULT_FILE':
+                    msg = 'Backend DEFAULT_FILE is reserved for File ' \
+                          'Persona. Cannot specify it for Block operations'
+                    LOG.error(msg)
+                    return json.dumps({'Err': msg})
+
                 # check if current_backend present in config file
                 if current_backend in self._backend_configs:
                     # check if current_backend is initialised
@@ -209,28 +344,14 @@ class VolumePlugin(object):
                     return json.dumps({u"Err": msg})
 
             if 'importVol' in input_list:
-                if not len(input_list) == 1:
-                    if len(input_list) == 2 and 'backend' in input_list:
-                        pass
-                    else:
-                        msg = (_('%(input_list)s cannot be '
-                                 ' specified at the same '
-                                 'time') % {'input_list': input_list, })
-                        LOG.error(msg)
-                        return json.dumps({u"Err": six.text_type(msg)})
-
                 existing_ref = str(contents['Opts']['importVol'])
-                return self.orchestrator.manage_existing(volname,
+                return self.orchestrator.manage_existing(name,
                                                          existing_ref,
-                                                         current_backend)
+                                                         current_backend,
+                                                         contents['Opts'])
 
             if 'help' in contents['Opts']:
-                create_help_path = "./config/create_help.txt"
-                create_help_file = open(create_help_path, "r")
-                create_help_content = create_help_file.read()
-                create_help_file.close()
-                LOG.error(create_help_content)
-                return json.dumps({u"Err": create_help_content})
+                return self._process_help(contents['Opts']['help'])
 
             # Populating the values
             if ('size' in contents['Opts'] and
@@ -284,7 +405,9 @@ class VolumePlugin(object):
                     contents['Opts']['fsOwner'] != ""):
                 fs_owner = contents['Opts']['fsOwner']
                 try:
-                    mode = fs_owner.split(':')
+                    uid, gid = fs_owner.split(':')
+                    int(uid)
+                    int(gid)
                 except ValueError as ex:
                     return json.dumps({'Err': "Invalid value '%s' specified "
                                        "for fsOwner. Please "
@@ -342,11 +465,24 @@ class VolumePlugin(object):
                     LOG.error(msg)
                     response = json.dumps({u"Err": msg})
                     return response
-                return self.volumedriver_create_snapshot(name,
+                schedule_opts = valid_snap_schedule_opts[1:]
+                for s_o in schedule_opts:
+                    if s_o in input_list:
+                        if "scheduleName" not in input_list:
+                            msg = (_('scheduleName is a mandatory parameter'
+                                     ' for creating a snapshot schedule'))
+                            LOG.error(msg)
+                            response = json.dumps({u"Err": msg})
+                            return response
+                        break
+                return self.volumedriver_create_snapshot(request,
                                                          mount_conflict_delay,
                                                          opts)
             elif 'cloneOf' in contents['Opts']:
-                return self.volumedriver_clone_volume(name, opts)
+                LOG.info('hpe_storage_api: clone options : %s' %
+                         contents['Opts'])
+                return self.volumedriver_clone_volume(request,
+                                                      contents['Opts'])
             for i in input_list:
                 if i in valid_snap_schedule_opts:
                     if 'virtualCopyOf' not in input_list:
@@ -372,7 +508,7 @@ class VolumePlugin(object):
         except exception.InvalidInput as ex:
             return json.dumps({u"Err": ex.msg})
 
-        return self.orchestrator.volumedriver_create(volname, vol_size,
+        return self.orchestrator.volumedriver_create(name, vol_size,
                                                      vol_prov,
                                                      vol_flash,
                                                      compression_val,
@@ -382,6 +518,28 @@ class VolumePlugin(object):
                                                      cpg, snap_cpg,
                                                      current_backend,
                                                      rcg_name)
+
+    def _process_help(self, help):
+        LOG.info("Working on help content generation...")
+        if help == 'backends':
+
+            line = "=" * 54
+            spaces = ' ' * 42
+            resp = "\n%s\nNAME%sSTATUS\n%s\n" % (line, spaces, line)
+
+            printable_len = 45
+            for k, v in self.orchestrator._manager.items():
+                backend_state = v['backend_state']
+                padding = (printable_len - len(k)) * ' '
+                resp += "%s%s  %s\n" % (k, padding, backend_state)
+            return json.dumps({u'Err': resp})
+        else:
+            create_help_path = "./config/create_help.txt"
+            create_help_file = open(create_help_path, "r")
+            create_help_content = create_help_file.read()
+            create_help_file.close()
+            LOG.error(create_help_content)
+            return json.dumps({u"Err": create_help_content})
 
     def _validate_rcg_params(self, rcg_name, backend_name):
         LOG.info("Validating RCG: %s, backend name: %s..." % (rcg_name,
@@ -393,16 +551,17 @@ class VolumePlugin(object):
 
         if rcg_name and not replication_device:
             msg = "Request to create replicated volume cannot be fulfilled " \
-                  "without defining 'replication_device' entry in " \
-                  "hpe.conf for the desired or default backend. " \
-                  "Please add it and execute the request again."
+                  "without defining 'replication_device' entry defined in " \
+                  "hpe.conf for the backend '%s'. Please add it and execute " \
+                  "the request again." % backend_name
             raise exception.InvalidInput(reason=msg)
 
         if replication_device and not rcg_name:
-            msg = "Request to create replicated volume cannot be fulfilled " \
-                  "without specifying 'rcg_name' parameter in the request. " \
-                  "Please specify 'rcg_name' and execute the request again."
-            raise exception.InvalidInput(reason=msg)
+            LOG.info("'%s' is a replication enabled backend. "
+                     "'replicationGroup' is not specified in the create "
+                     "volume command. Proceeding to create a regular "
+                     "volume without remote copy "
+                     "capabilities." % (backend_name))
 
         if rcg_name and replication_device:
 
@@ -434,7 +593,8 @@ class VolumePlugin(object):
                     sync_period = int(sync_period)
                 except ValueError as ex:
                     msg = "Non-integer value '%s' not allowed for " \
-                          "'sync_period'" % replication_device.sync_period
+                          "'sync_period'. %s" % (
+                              replication_device.sync_period, ex)
                     raise exception.InvalidInput(reason=msg)
                 else:
                     SYNC_PERIOD_LOW = 300
@@ -454,7 +614,7 @@ class VolumePlugin(object):
             LOG.error(msg)
             raise exception.HPEPluginCreateException(reason=msg)
 
-    def volumedriver_clone_volume(self, name, opts=None):
+    def volumedriver_clone_volume(self, name, clone_opts=None):
         # Repeating the validation here in anticipation that when
         # actual REST call for clone is added, this
         # function will have minimal impact
@@ -479,9 +639,11 @@ class VolumePlugin(object):
 
         src_vol_name = str(contents['Opts']['cloneOf'])
         clone_name = contents['Name']
+        LOG.info('hpe_storage_api - volumedriver_clone_volume '
+                 'clone_options 1 : %s ' % clone_opts)
 
         return self.orchestrator.clone_volume(src_vol_name, clone_name, size,
-                                              cpg, snap_cpg)
+                                              cpg, snap_cpg, clone_opts)
 
     def volumedriver_create_snapshot(self, name, mount_conflict_delay,
                                      opts=None):
@@ -515,13 +677,6 @@ class VolumePlugin(object):
         if 'Opts' in contents and contents['Opts'] and \
                 'expirationHours' in contents['Opts']:
             expiration_hrs = int(contents['Opts']['expirationHours'])
-            if has_schedule:
-                msg = ('create schedule failed, error is: setting '
-                       'expiration_hours for docker snapshot is not'
-                       ' allowed while creating a schedule.')
-                LOG.error(msg)
-                response = json.dumps({'Err': msg})
-                return response
 
         retention_hrs = None
         if 'Opts' in contents and contents['Opts'] and \
@@ -529,6 +684,15 @@ class VolumePlugin(object):
             retention_hrs = int(contents['Opts']['retentionHours'])
 
         if has_schedule:
+            if 'expirationHours' in contents['Opts'] or \
+                    'retentionHours' in contents['Opts']:
+                msg = ('create schedule failed, error is : setting '
+                       'expirationHours or retentionHours for docker base '
+                       'snapshot is not allowed while creating a schedule')
+                LOG.error(msg)
+                response = json.dumps({'Err': msg})
+                return response
+
             if 'scheduleFrequency' not in contents['Opts']:
                 msg = ('create schedule failed, error is: user  '
                        'has not passed scheduleFrequency to create'
@@ -574,6 +738,9 @@ class VolumePlugin(object):
                     response = json.dumps({'Err': msg})
                     return response
                 schedName = str(contents['Opts']['scheduleName'])
+                if schedName == "auto":
+                    schedName = self.generate_schedule_with_timestamp()
+
                 snapPrefix = str(contents['Opts']['snapshotPrefix'])
 
                 schedNameLength = len(schedName)
@@ -601,6 +768,18 @@ class VolumePlugin(object):
                                                  has_schedule,
                                                  schedFrequency)
 
+    def generate_schedule_with_timestamp(self):
+        current_time = datetime.datetime.now()
+        current_time_str = str(current_time)
+        space_replaced = current_time_str.replace(' ', '_')
+        colon_replaced = space_replaced.replace(':', '_')
+        hypen_replaced = colon_replaced.replace('-', '_')
+        scheduleNameGenerated = hypen_replaced
+        LOG.info(' Schedule Name auto generated is %s' % scheduleNameGenerated)
+        return scheduleNameGenerated
+
+    @on_exception(expo, RateLimitException, max_tries=8)
+    @limits(calls=25, period=30)
     @app.route("/VolumeDriver.Mount", methods=["POST"])
     def volumedriver_mount(self, name):
         """
@@ -622,16 +801,25 @@ class VolumePlugin(object):
         volname = contents['Name']
 
         vol_mount = volume.DEFAULT_MOUNT_VOLUME
-        if ('Opts' in contents and contents['Opts'] and
-                'mount-volume' in contents['Opts']):
-            vol_mount = str(contents['Opts']['mount-volume'])
 
         mount_id = contents['ID']
 
         try:
-            return self.orchestrator.mount_volume(volname, vol_mount, mount_id)
-        except Exception as ex:
-            return {'Err': six.text_type(ex)}
+            return self._req_router.route_mount_request(volname, mount_id)
+        except exception.EtcdMetadataNotFound:
+            pass
+
+        if self.orchestrator:
+            try:
+                return self.orchestrator.mount_volume(volname,
+                                                      vol_mount,
+                                                      mount_id)
+            except Exception as ex:
+                return json.dumps({'Err': six.text_type(ex)})
+
+        return json.dumps({"Err": "ERROR: Cannot mount volume '%s'. "
+                                  "Volume driver is not configured" %
+                                  volname})
 
     @app.route("/VolumeDriver.Path", methods=["POST"])
     def volumedriver_path(self, name):
@@ -645,7 +833,15 @@ class VolumePlugin(object):
         contents = json.loads(name.content.getvalue())
         volname = contents['Name']
 
-        return self.orchestrator.get_path(volname)
+        try:
+            return self._req_router.route_get_path_request(volname)
+        except exception.EtcdMetadataNotFound:
+            pass
+
+        if self.orchestrator:
+            return self.orchestrator.get_path(volname)
+
+        return json.dumps({u"Err": '', u"Mountpoint": ''})
 
     @app.route("/VolumeDriver.Capabilities", methods=["POST"])
     def volumedriver_getCapabilities(self, body):
@@ -679,8 +875,18 @@ class VolumePlugin(object):
         if token_cnt == 2:
             snapname = tokens[1]
 
-        return self.orchestrator.get_volume_snap_details(volname, snapname,
-                                                         qualified_name)
+        # Check if share exists by this name. If so return its details
+        # else allow volume driver to process the request
+        try:
+            return self._req_router.get_object_details(volname)
+        except exception.EtcdMetadataNotFound:
+            pass
+
+        if self.orchestrator:
+            return self.orchestrator.get_volume_snap_details(volname,
+                                                             snapname,
+                                                             qualified_name)
+        return json.dumps({u"Err": '', u"Volume": ''})
 
     @app.route("/VolumeDriver.List", methods=["POST"])
     def volumedriver_list(self, body):
@@ -691,4 +897,14 @@ class VolumePlugin(object):
 
         :return: Result indicating success.
         """
-        return self.orchestrator.volumedriver_list()
+        share_list = self._req_router.list_objects()
+
+        volume_list = []
+        if self.orchestrator:
+            volume_list = self.orchestrator.volumedriver_list()
+
+        final_list = share_list + volume_list
+        if not final_list:
+            return json.dumps({u"Err": ''})
+
+        return json.dumps({u"Err": '', u"Volumes": final_list})

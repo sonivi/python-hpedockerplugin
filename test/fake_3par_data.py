@@ -38,6 +38,8 @@ SNAPSHOT_ID2 = '8da7488a-7920-451a-ad18-0e41eca15d25'
 SNAPSHOT_NAME2 = 'snapshot-2'
 SNAPSHOT_ID3 = 'f5d9e226-2995-4d66-a5bd-3e373f4ff772'
 SNAPSHOT_NAME3 = 'snapshot-3'
+SNAPSHOT_ID4 = 'f5d9e226-2995-4d66-a5bd-3e373f4ff774'
+SNAPSHOT_NAME4 = 'snapshot-4'
 VOLUME_3PAR_NAME = 'dcv-0DM4qZEVSKON-DXN-NwVpw'
 SNAPSHOT_3PAR_NAME1 = 'dcs-0DM4qZEVSKON-DXN-NwVpw'
 SNAPSHOT_3PAR_NAME = 'dcs-L4I73ONuTci9Fd4ceij-MQ'
@@ -54,6 +56,7 @@ REMOTE_RCG_NAME = "TEST-RCG.r123456"
 RCG_STARTED = 3
 RCG_STOPPED = 5
 ROLE_PRIMARY = 1
+ROLE_PRIMARY_REV = 1
 ROLE_SECONDARY = 2
 
 FAKE_DESC = 'test description name'
@@ -88,6 +91,48 @@ FAKE_ISCSI_PORTS = [{
     'IPAddr': '1.1.1.2',
     'iSCSIName': TARGET_IQN,
 }]
+
+share = {
+    'backend': 'DEFAULT',
+    'id': 'FAKE_UUID',
+    # 'fpg': [{'imran_fpg': ['10.50.9.90']}],
+    'fpg': 'DockerFpg_0',
+    'vfs': 'DockerVfs_0',
+    'vfsIP': '10.50.9.90',
+    'fstore': 'imran_fstore',
+    'name': 'DemoShare-99',
+    'display_name': 'DemoShare-99',
+    'shareDir': 'DemoShareDir99',
+    'protocol': 'nfs',
+    'readonly': False,
+    'softQuota': None,
+    'hardQuota': None,
+    'clientIPs': [],
+    'protocolOpts': None,
+    'snapshots': [],
+    'comment': 'Demo Share 99',
+}
+
+share_to_remove = {
+    'backend': 'DEFAULT',
+    'id': 'FAKE_UUID',
+    # 'fpg': [{'imran_fpg': ['10.50.9.90']}],
+    'fpg': 'imran_fpg',
+    'vfs': 'imran_vfs',
+    'vfsIP': '10.50.9.90',
+    'fstore': 'ia_fstore',
+    'name': 'ia_fstore',
+    'display_name': 'ia_fstore',
+    'shareDir': None,
+    'protocol': 'nfs',
+    'readonly': False,
+    'softQuota': None,
+    'hardQuota': None,
+    'clientIPs': [],
+    'protocolOpts': None,
+    'snapshots': [],
+    'comment': 'Test Share 06',
+}
 
 volume = {
     'name': VOLUME_NAME,
@@ -131,15 +176,46 @@ replicated_volume = {
                  'remote_rcg_name': REMOTE_RCG_NAME}
 }
 
-primary_3par_rcg = {
-    'role': ROLE_PRIMARY,
-    'targets': [{'roleReversed': False}]
+pp_rcg_policies = {'autoRecover': False,
+                   'overPeriodAlert': False,
+                   'autoFailover': False,
+                   'pathManagement': False}
+normal_rcg = {
+    'primary_3par_rcg': {
+        'name': RCG_NAME,
+        'role': ROLE_PRIMARY,
+        'targets': [{'roleReversed': False,
+                     'policies': pp_rcg_policies
+                     }],
+    },
+    'secondary_3par_rcg': {
+        'role': ROLE_SECONDARY,
+        'targets': [{'roleReversed': False}]
+    }
 }
 
-secondary_3par_rcg = {
-    'role': ROLE_SECONDARY,
-    'targets': [{'roleReversed': False}]
+failover_rcg = {
+    'primary_3par_rcg': {
+        'role': ROLE_PRIMARY,
+        'targets': [{'roleReversed': False}]
+    },
+    'secondary_3par_rcg': {
+        'role': ROLE_PRIMARY_REV,
+        'targets': [{'roleReversed': True}]
+    }
 }
+
+recover_rcg = {
+    'primary_3par_rcg': {
+        'role': ROLE_SECONDARY,
+        'targets': [{'roleReversed': True}]
+    },
+    'secondary_3par_rcg': {
+        'role': ROLE_PRIMARY,
+        'targets': [{'roleReversed': True}]
+    }
+}
+
 
 json_path_info = \
     '{"connection_info": {"driver_volume_type": "iscsi", ' \
@@ -209,10 +285,12 @@ vol_mounted_on_other_node = {
     'snapshots': [],
     'node_mount_info': {OTHER_NODE_ID: ['Fake-Mount-ID']},
     'path_info': path_info,
+    'old_path_info': [(THIS_NODE_ID, json_path_info)],
     'mount_conflict_delay': MOUNT_CONFLICT_DELAY,
     'is_snap': False,
     'backend': 'DEFAULT'
 }
+
 
 volume_mounted_twice_on_this_node = {
     'name': VOLUME_NAME,
@@ -309,6 +387,40 @@ snap3 = {
     'mount_conflict_delay': MOUNT_CONFLICT_DELAY,
 }
 
+snap4_schedule = {
+    'schedule_name': "3parsched1",
+    'snap_name_prefix': "pqrst",
+    'sched_frequency': "10 * * * *",
+    'sched_snap_exp_hrs': 4,
+    'sched_snap_ret_hrs': 2
+}
+snap4_metadata = {
+    'name': SNAPSHOT_NAME4,
+    'id': SNAPSHOT_ID4,
+    'parent_name': SNAPSHOT_NAME1,
+    'parent_id': SNAPSHOT_ID1,
+    'expiration_hours': None,
+    'retention_hours': None,
+    'fsOwner': None,
+    'fsMode': None,
+    'snap_schedule': snap4_schedule,
+}
+snap4 = {
+    'name': SNAPSHOT_NAME4,
+    'id': SNAPSHOT_ID4,
+    'display_name': SNAPSHOT_NAME4,
+    # This is a child of ref_to_snap1
+    'parent_id': VOLUME_ID,
+    'ParentName': VOLUME_NAME,
+    'is_snap': True,
+    'has_schedule': True,
+    'size': 2,
+    'snap_metadata': snap4_metadata,
+    'snapshots': [],
+    'mount_conflict_delay': MOUNT_CONFLICT_DELAY,
+    'backend': 'DEFAULT'
+}
+
 ref_to_snap1 = {
     'name': SNAPSHOT_NAME1,
     'id': SNAPSHOT_ID1,
@@ -329,6 +441,14 @@ ref_to_snap3 = {
     # This is a child of ref_to_snap1
     'parent_id': SNAPSHOT_ID1,
     'ParentName': VOLUME_NAME
+}
+
+ref_to_snap4 = {
+    'name': SNAPSHOT_NAME4,
+    'id': SNAPSHOT_ID4,
+    'parent_id': VOLUME_ID,
+    'ParentName': VOLUME_NAME,
+    'snap_schedule': snap4_schedule
 }
 
 bkend_snapshots = [SNAPSHOT_3PAR_NAME]
@@ -354,6 +474,22 @@ volume_with_snapshots = {
     'flash_cache': None,
     'compression': None,
     'snapshots': [ref_to_snap1, ref_to_snap2],
+    'mount_conflict_delay': MOUNT_CONFLICT_DELAY,
+    'is_snap': False,
+    'has_schedule': False,
+    'backend': 'DEFAULT'
+}
+
+volume_with_snap_schedule = {
+    'name': VOLUME_NAME,
+    'id': VOLUME_ID,
+    'display_name': VOL_DISP_NAME,
+    'size': 2,
+    'host': FAKE_DOCKER_HOST,
+    'provisioning': THIN,
+    'flash_cache': None,
+    'compression': None,
+    'snapshots': [ref_to_snap4],
     'mount_conflict_delay': MOUNT_CONFLICT_DELAY,
     'is_snap': False,
     'has_schedule': False,

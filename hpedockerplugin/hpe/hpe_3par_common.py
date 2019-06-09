@@ -206,8 +206,8 @@ class HPE3PARCommon(object):
                  {"common_ver": self.VERSION,
                   "rest_ver": hpe3parclient.get_version_string()})
 
-        self.client_login()
         try:
+            self.client_login()
             cpg_names = self.src_bkend_config.hpe3par_cpg
             for cpg_name in cpg_names:
                 self.validate_cpg(cpg_name)
@@ -311,7 +311,8 @@ class HPE3PARCommon(object):
             msg = _("Failed to get qos from VV set %s - %s.") %\
                    (vvset, ex)
             LOG.error(msg)
-            raise exception.HPEDriverGetQosFromVvSetFailed(ex)
+            raise exception.HPEDriverGetQosFromVvSetFailed(vvset_name=vvset,
+                                                           reason=ex)
 
     def get_vvset_detail(self, vvset):
         return self.client.getVolumeSet(vvset)
@@ -339,8 +340,8 @@ class HPE3PARCommon(object):
             LOG.info(msg)
             pass
         else:
-            msg = _("Managing volume %s failed because its attached.") %\
-                   (existing_ref)
+            msg = "Managing volume %s failed because it is attached." % \
+                  existing_ref
             LOG.error(msg)
             raise exception.HPEDriverManageVolumeAttached(reason=msg)
 

@@ -98,8 +98,8 @@ class HPE3PARISCSIDriver(object):
         self._check_flags(common)
         common.check_for_setup_error()
 
-        common.client_login()
         try:
+            common.client_login()
             self.initialize_iscsi_ports(common)
         finally:
             self._logout(common)
@@ -773,5 +773,12 @@ class HPE3PARISCSIDriver(object):
         common = self._login()
         try:
             return common.is_vol_having_active_task(vol_name)
+        finally:
+            self._logout(common)
+
+    def get_domain(self, cpg_name):
+        common = self._login()
+        try:
+            return common.get_domain(cpg_name)
         finally:
             self._logout(common)
